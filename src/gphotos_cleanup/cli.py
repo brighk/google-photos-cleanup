@@ -41,6 +41,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run Chrome headlessly. Log in once with --login first.",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help=(
+            "Number of photos processed at the same time, each in its own "
+            "browser tab (default: 4, max: 16)."
+        ),
+    )
+    parser.add_argument(
         "--login",
         action="store_true",
         help=(
@@ -52,7 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if not 1 <= args.workers <= 16:
+        parser.error("--workers must be between 1 and 16")
 
     if args.login:
         open_login_browser(args.profile.expanduser().resolve())
@@ -63,6 +75,7 @@ def main() -> None:
         profile_dir=args.profile.expanduser().resolve(),
         delete=args.delete,
         headless=args.headless,
+        workers=args.workers,
     )
 
     print()

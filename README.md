@@ -47,6 +47,12 @@ gphotos-cleanup \
   --profile ~/.config/gphotos-cleanup/chromium
 ```
 
+## Parallel downloads
+
+`--workers N` (default 4, max 16) processes N photos at the same time, each in
+its own browser tab. Start with `--workers 1` to confirm downloads work, then
+raise it. Too many parallel requests can get the account rate-limited.
+
 ## Download, verify, then move downloaded items to Trash
 
 ```bash
