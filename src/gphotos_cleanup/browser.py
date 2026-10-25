@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import (
     BrowserContext,
@@ -22,6 +22,24 @@ LOGIN_URL = (
     "https://accounts.google.com/ServiceLogin?continue=" + PHOTOS_URL
 )
 
+
+# Button labels are localized; the account's language wins over the browser's.
+# We ask for English with ?hl=en, and also accept Bulgarian in case Google
+# ignores that.
+# Anchored: a trashed photo also shows a "30 days left until permanently
+# deleted" button, which must never match.
+TRASH_LABEL = re.compile(
+    r"^\s*(move to trash|delete|преместване в кошчето|изтриване)\s*$", re.I
+)
+ALREADY_TRASHED = re.compile(r"until permanently deleted", re.I)
+# Google's trash dialog ("Moving items to trash") confirms with "Got it".
+TRASH_DIALOG_TEXT = re.compile(r"trash|кошче", re.I)
+TRASH_CONFIRM_LABEL = re.compile(
+    r"^\s*(got it|move to trash|delete|разбрах|преместване в кошчето"
+    r"|изтриване)\s*$",
+    re.I,
+)
+MORE_LABEL = re.compile(r"more options|\bmore\b|още опции", re.I)
 
 CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
@@ -42,6 +60,29 @@ def open_login_browser(profile_dir: Path) -> None:
         ],
         check=False,
     )
+
+
+async def _click_lenient(locator: Locator) -> None:
+    """
+    Click, tolerating Playwright timing out after the click was dispatched
+    (seen on Google's dialog buttons). Callers verify the outcome themselves.
+    """
+    try:
+        await locator.click(timeout=5000)
+    except PlaywrightTimeoutError:
+        pass
+
+
+def _item_id(media_url: str) -> str:
+    """The AF1Qip... id at the end of a /photo/ or /video/ URL."""
+    return urlsplit(media_url).path.rstrip("/").rsplit("/", 1)[-1]
+
+
+def _with_english(url: str) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query))
+    query["hl"] = "en"
+    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
 class GooglePhotosBrowser:
@@ -135,8 +176,11 @@ class GooglePhotosBrowser:
         Scroll the main Photos view and yield unique media item URLs.
 
         Google Photos currently exposes individual media links whose href contains
-        '/photo/' or '/video/'. The UI is virtualized, so we keep scrolling until
-        several consecutive scrolls discover nothing new.
+        '/photo/' or '/video/'. The grid is virtualized: only rows near the
+        viewport exist in the DOM, so we scroll less than one screen at a time
+        (bigger jumps skip rows that never render) and stop only once the
+        scroll container is at the bottom and nothing new has appeared for a
+        while.
         """
         page = self._require_page()
         await page.goto(PHOTOS_URL, wait_until="domcontentloaded")
@@ -144,8 +188,10 @@ class GooglePhotosBrowser:
 
         seen: set[str] = set()
         idle_rounds = 0
+        size = page.viewport_size or {"width": 1280, "height": 720}
+        step = int(size["height"] * 0.6)
 
-        while idle_rounds < 6:
+        while True:
             links = page.locator('a[href*="/photo/"], a[href*="/video/"]')
             hrefs = await links.evaluate_all(
                 "els => els.map(e => e.getAttribute('href'))"
@@ -171,10 +217,37 @@ class GooglePhotosBrowser:
             else:
                 idle_rounds = 0
 
-            size = page.viewport_size or {"width": 1280, "height": 720}
+            # At the bottom, give lazy loading ~10s to append more rows.
+            # Away from the bottom, a long idle stretch (~45s) means loading
+            # is stuck, so give up rather than loop forever.
+            if idle_rounds >= 30 or (
+                idle_rounds >= 7 and await self._grid_at_bottom(page)
+            ):
+                print(f"Found {len(seen)} items in the Photos grid.")
+                return
+
             await page.mouse.move(size["width"] / 2, size["height"] / 2)
-            await page.mouse.wheel(0, 5000)
-            await page.wait_for_timeout(1200)
+            await page.mouse.wheel(0, step)
+            await page.wait_for_timeout(1500)
+
+    @staticmethod
+    async def _grid_at_bottom(page: Page) -> bool:
+        # The grid scrolls inside its own container, not the window, so check
+        # the tallest scrollable element.
+        return await page.evaluate(
+            """() => {
+                let best = document.scrollingElement;
+                for (const el of document.querySelectorAll('*')) {
+                    const overflow = getComputedStyle(el).overflowY;
+                    if ((overflow === 'auto' || overflow === 'scroll')
+                        && el.scrollHeight > el.clientHeight
+                        && el.scrollHeight > best.scrollHeight) {
+                        best = el;
+                    }
+                }
+                return best.scrollTop + best.clientHeight >= best.scrollHeight - 50;
+            }"""
+        )
 
     async def download_media(self, page: Page, media_url: str) -> Path:
         await self._open_item(page, media_url)
@@ -205,53 +278,122 @@ class GooglePhotosBrowser:
         return destination
 
     async def move_to_trash(self, page: Page, media_url: str) -> None:
+        """
+        Move one item to Trash. Returns only when the trash was confirmed;
+        raises otherwise, so the caller never marks an untrashed item deleted.
+        """
         await self._open_item(page, media_url)
+        item_id = _item_id(media_url)
+
+        # Trashed items still open at their normal URL, with a countdown
+        # instead. Seen when a previous run trashed it but stopped before
+        # recording it.
+        if await page.get_by_text(ALREADY_TRASHED).count() > 0:
+            return
 
         # Prefer a directly exposed trash/delete button if present.
-        direct = page.get_by_role(
-            "button",
-            name=re.compile(r"(move to trash|delete)", re.I),
-        ).filter(visible=True)
+        direct = page.get_by_role("button", name=TRASH_LABEL).filter(
+            visible=True
+        )
         if await direct.count() > 0:
-            await direct.first.click()
+            await _click_lenient(direct.first)
         else:
             await self._open_more_menu(page)
-            item = await self._menu_item(page, "Move to trash")
-            if await item.count() == 0:
-                item = await self._menu_item(page, "Delete")
+            item = page.get_by_role("menuitem", name=TRASH_LABEL).filter(
+                visible=True
+            )
             if await item.count() == 0:
                 raise RuntimeError(
                     f"Could not find trash/delete action for {media_url}. "
                     + await self._debug_hint(page)
                 )
-            await item.first.click()
+            await _click_lenient(item.first)
 
-        await self._confirm_trash(page)
+        await self._confirm_trash(page, media_url, item_id)
 
-    async def _confirm_trash(self, page: Page) -> None:
-        candidates = [
-            page.get_by_role(
-                "button",
-                name=re.compile(r"move to trash", re.I),
-            ),
-            page.get_by_role(
-                "button",
-                name=re.compile(r"delete", re.I),
-            ),
-        ]
+        # After trashing, the viewer moves to the next item or back to the
+        # grid. Still showing this item means the trash didn't happen.
+        try:
+            await page.wait_for_function(
+                "id => !location.href.includes(id)", arg=item_id, timeout=10_000
+            )
+        except PlaywrightTimeoutError:
+            raise RuntimeError(
+                f"Trash was not confirmed for {media_url}: the photo is still "
+                "open after confirming. " + await self._debug_hint(page)
+            ) from None
 
-        for candidate in candidates:
-            try:
-                if await candidate.count() > 0:
-                    await candidate.last.click(timeout=3000)
-                    await page.wait_for_timeout(600)
+    async def _confirm_trash(
+        self, page: Page, media_url: str, item_id: str
+    ) -> None:
+        """
+        Click through Google's trash dialogs. Currently there are two in a
+        row: a "Moving items to trash" notice ("Got it", possibly shown only
+        once) and a "Remove from your Google Account?" box ("Move to trash").
+        Stops as soon as the item leaves the viewer; move_to_trash then
+        double-checks that.
+        """
+        dialog = (
+            page.locator('[role="dialog"], [role="alertdialog"]')
+            .filter(visible=True)
+            .filter(has_text=TRASH_DIALOG_TEXT)
+        )
+        for step in range(3):
+            # The first dialog must show up (or the item must close); after
+            # that, give a follow-up dialog a few seconds to appear.
+            deadline = time.monotonic() + (5 if step == 0 else 3)
+            while await dialog.count() == 0:
+                if item_id not in page.url:
                     return
+                if time.monotonic() > deadline:
+                    if step == 0:
+                        raise RuntimeError(
+                            "Neither a trash dialog appeared nor did the "
+                            f"photo close for {media_url}. "
+                            + await self._debug_hint(page)
+                        )
+                    return
+                await page.wait_for_timeout(200)
+
+            current = dialog.first
+            text = await current.inner_text()
+            confirm = current.get_by_role("button", name=TRASH_CONFIRM_LABEL)
+            if await confirm.count() == 0:
+                raise RuntimeError(
+                    f"Could not find the confirm button in the trash dialog "
+                    f"for {media_url}. " + await self._debug_hint(page)
+                )
+            await _click_lenient(confirm.last)
+
+            # Wait for this dialog to go away (the next one, if any, has
+            # different text).
+            try:
+                await page.wait_for_function(
+                    """text => ![...document.querySelectorAll(
+                        '[role=dialog],[role=alertdialog]')].some(e =>
+                        e.getClientRects().length && e.innerText === text)""",
+                    arg=text,
+                    timeout=10_000,
+                )
             except PlaywrightTimeoutError:
-                continue
+                raise RuntimeError(
+                    f"Trash dialog for {media_url} stayed open after "
+                    "confirming. " + await self._debug_hint(page)
+                ) from None
+
+        raise RuntimeError(
+            f"Too many trash dialogs for {media_url}. "
+            + await self._debug_hint(page)
+        )
 
     async def _open_item(self, page: Page, media_url: str) -> None:
-        await page.goto(media_url, wait_until="domcontentloaded")
+        await page.goto(_with_english(media_url), wait_until="domcontentloaded")
         await page.wait_for_timeout(1500)
+        # Never act on a page that isn't this item (e.g. a redirect).
+        if _item_id(media_url) not in page.url:
+            raise RuntimeError(
+                f"Opening {media_url} landed on {page.url} instead."
+            )
         # The viewer toolbar only appears after mouse movement.
         await self._reveal_toolbar(page)
 
@@ -265,14 +407,7 @@ class GooglePhotosBrowser:
     async def _open_more_menu(self, page: Page) -> None:
         await self._reveal_toolbar(page)
         candidates = [
-            page.get_by_role(
-                "button",
-                name=re.compile(r"more options", re.I),
-            ).filter(visible=True),
-            page.get_by_role(
-                "button",
-                name=re.compile(r"\bmore\b", re.I),
-            ).filter(visible=True),
+            page.get_by_role("button", name=MORE_LABEL).filter(visible=True),
             page.locator('[aria-label*="More"]').filter(visible=True),
         ]
 
