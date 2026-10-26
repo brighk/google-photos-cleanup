@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 import re
@@ -39,6 +40,12 @@ TRASH_CONFIRM_LABEL = re.compile(
     r"|изтриване)\s*$",
     re.I,
 )
+# Large videos: Google shows "Downloading..." while it prepares the file, and
+# the browser download can start well after 15 s.
+PREPARING_DOWNLOAD = re.compile(r"^\s*(downloading|изтегля)", re.I)
+# The menu item's name includes its shortcut ("Download Shift+D").
+DOWNLOAD_MENU_LABEL = re.compile(r"^\s*(download|изтегляне)\b", re.I)
+DOWNLOAD_TIMEOUT_S = 300
 MORE_LABEL = re.compile(r"more options|\bmore\b|още опции", re.I)
 
 CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -252,23 +259,40 @@ class GooglePhotosBrowser:
     async def download_media(self, page: Page, media_url: str) -> Path:
         await self._open_item(page, media_url)
 
-        # Shift+D is Google Photos' own download shortcut; it doesn't depend
-        # on toolbar selectors. Fall back to the More menu if it does nothing.
+        # One waiter for the whole attempt, so a download that starts late
+        # (from Shift+D or the menu) is still caught.
+        waiter = asyncio.ensure_future(
+            page.wait_for_event("download", timeout=DOWNLOAD_TIMEOUT_S * 1000)
+        )
         try:
-            async with page.expect_download(timeout=15_000) as download_info:
-                await page.keyboard.press("Shift+D")
-            download = await download_info.value
-        except PlaywrightTimeoutError:
-            await self._open_more_menu(page)
-            download_item = await self._menu_item(page, "Download")
-            if await download_item.count() == 0:
-                raise RuntimeError(
-                    f"Could not find Download menu item for {media_url}. "
-                    + await self._debug_hint(page)
+            # Shift+D is Google Photos' own download shortcut; it doesn't
+            # depend on toolbar selectors.
+            await page.keyboard.press("Shift+D")
+            fallback_at = time.monotonic() + 15
+            used_menu = False
+            while not waiter.done():
+                await asyncio.sleep(0.5)
+                if used_menu or time.monotonic() < fallback_at:
+                    continue
+                preparing = page.get_by_text(PREPARING_DOWNLOAD).filter(
+                    visible=True
                 )
-            async with page.expect_download(timeout=60_000) as download_info:
-                await download_item.first.click()
-            download = await download_info.value
+                if await preparing.count() > 0:
+                    # Google is still preparing it; keep waiting.
+                    continue
+                # Nothing happened: try the More menu once.
+                used_menu = True
+                await self._click_menu_download(page, media_url)
+            try:
+                download = waiter.result()
+            except PlaywrightTimeoutError:
+                raise RuntimeError(
+                    f"No download started within {DOWNLOAD_TIMEOUT_S}s for "
+                    f"{media_url}. " + await self._debug_hint(page)
+                ) from None
+        finally:
+            if not waiter.done():
+                waiter.cancel()
 
         destination = self._reserve_download_path(download)
         try:
@@ -276,6 +300,18 @@ class GooglePhotosBrowser:
         finally:
             self._reserved.discard(destination)
         return destination
+
+    async def _click_menu_download(self, page: Page, media_url: str) -> None:
+        await self._open_more_menu(page)
+        item = page.get_by_role("menuitem", name=DOWNLOAD_MENU_LABEL).filter(
+            visible=True
+        )
+        if await item.count() == 0:
+            raise RuntimeError(
+                f"Could not find Download menu item for {media_url}. "
+                + await self._debug_hint(page)
+            )
+        await _click_lenient(item.first)
 
     async def move_to_trash(self, page: Page, media_url: str) -> None:
         """
@@ -288,13 +324,17 @@ class GooglePhotosBrowser:
         # Trashed items still open at their normal URL, with a countdown
         # instead. Seen when a previous run trashed it but stopped before
         # recording it.
-        if await page.get_by_text(ALREADY_TRASHED).count() > 0:
+        trashed = page.get_by_text(ALREADY_TRASHED).filter(visible=True)
+        if await trashed.count() > 0:
             return
 
         # Prefer a directly exposed trash/delete button if present.
         direct = page.get_by_role("button", name=TRASH_LABEL).filter(
             visible=True
         )
+        # Re-check right before acting: the URL check in _open_item is the
+        # only proof the viewer shows this item, and later checks rely on it.
+        self._assert_on_item(page, media_url)
         if await direct.count() > 0:
             await _click_lenient(direct.first)
         else:
@@ -307,6 +347,7 @@ class GooglePhotosBrowser:
                     f"Could not find trash/delete action for {media_url}. "
                     + await self._debug_hint(page)
                 )
+            self._assert_on_item(page, media_url)
             await _click_lenient(item.first)
 
         await self._confirm_trash(page, media_url, item_id)
@@ -390,12 +431,16 @@ class GooglePhotosBrowser:
         await page.goto(_with_english(media_url), wait_until="domcontentloaded")
         await page.wait_for_timeout(1500)
         # Never act on a page that isn't this item (e.g. a redirect).
-        if _item_id(media_url) not in page.url:
-            raise RuntimeError(
-                f"Opening {media_url} landed on {page.url} instead."
-            )
+        self._assert_on_item(page, media_url)
         # The viewer toolbar only appears after mouse movement.
         await self._reveal_toolbar(page)
+
+    @staticmethod
+    def _assert_on_item(page: Page, media_url: str) -> None:
+        if _item_id(media_url) not in page.url:
+            raise RuntimeError(
+                f"Expected {media_url} but the browser is on {page.url}."
+            )
 
     @staticmethod
     async def _reveal_toolbar(page: Page) -> None:
@@ -406,20 +451,30 @@ class GooglePhotosBrowser:
 
     async def _open_more_menu(self, page: Page) -> None:
         await self._reveal_toolbar(page)
+        menu = page.locator('[role="menu"]').filter(visible=True)
         candidates = [
             page.get_by_role("button", name=MORE_LABEL).filter(visible=True),
             page.locator('[aria-label*="More"]').filter(visible=True),
         ]
 
+        # Judge success by the menu being open, not by the click returning:
+        # Playwright can time out on a click that Google did act on (seen
+        # while a video was playing). Re-check before each click, since
+        # clicking the button again would close an open menu.
         for candidate in candidates:
+            if await menu.count() > 0:
+                return
+            if await candidate.count() == 0:
+                continue
+            await _click_lenient(candidate.first)
             try:
-                if await candidate.count() > 0:
-                    await candidate.first.click(timeout=3000)
-                    await page.wait_for_timeout(300)
-                    return
+                await menu.first.wait_for(state="visible", timeout=3000)
+                return
             except PlaywrightTimeoutError:
                 continue
 
+        if await menu.count() > 0:
+            return
         raise RuntimeError(
             "Could not find the Google Photos More menu. "
             + await self._debug_hint(page)
@@ -446,13 +501,6 @@ class GooglePhotosBrowser:
             f"Visible buttons: {labels}. "
             + (f"Screenshot: {shot}" if shot else "Screenshot failed.")
         )
-
-    async def _menu_item(self, page: Page, text: str) -> Locator:
-        pattern = re.compile(rf"^{re.escape(text)}$", re.I)
-        item = page.get_by_role("menuitem", name=pattern)
-        if await item.count() > 0:
-            return item
-        return page.get_by_text(pattern)
 
     def _reserve_download_path(self, download: Download) -> Path:
         # No await in here, so picking and reserving a name is atomic with

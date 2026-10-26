@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .browser import GooglePhotosBrowser
@@ -107,6 +108,16 @@ async def _download_one(
     media_url: str,
 ) -> None:
     previous = state.get(media_url)
+    if previous is not None and previous.deleted:
+        # Trashed items don't show in the Photos grid, so this one was
+        # recorded as deleted but never actually trashed. Queue it again.
+        print(f"[WARN] marked deleted but still in library: {media_url}")
+        previous = MediaRecord(
+            url=previous.url,
+            local_path=previous.local_path,
+            verified=previous.verified,
+        )
+        state.put(previous)
     if previous is not None:
         local_path = Path(previous.local_path)
         if previous.verified and verify_file(local_path):
@@ -126,14 +137,23 @@ async def _download_one(
 
         if not verified:
             counts.failed += 1
-            print(f"[FAIL] verification failed: {media_url}")
+            _report_failure(state, f"verification failed: {media_url}")
             return
 
         counts.downloaded += 1
         print(f"[OK] downloaded: {local_path}")
     except Exception as exc:
         counts.failed += 1
-        print(f"[FAIL] download {media_url}: {exc}")
+        _report_failure(state, f"download {media_url}: {exc}")
+
+
+def _report_failure(state: StateStore, message: str) -> None:
+    """Print a failure and append it to a log next to the state file."""
+    print(f"[FAIL] {message}")
+    log = state.path.parent / ".gphotos-failures.log"
+    stamp = datetime.now().isoformat(timespec="seconds")
+    with log.open("a", encoding="utf-8") as fh:
+        fh.write(f"{stamp} {message}\n")
 
 
 async def _delete_all(
@@ -162,22 +182,24 @@ async def _delete_all(
         pending.put_nowait(record)
 
     async def delete_worker() -> None:
-        page = await browser.new_item_page()
-        try:
-            while not pending.empty():
-                record = pending.get_nowait()
-                try:
-                    await browser.move_to_trash(page, record.url)
-                except Exception as exc:
-                    # Stop everything on the first failure (TaskGroup
-                    # cancels the other workers).
-                    print(f"[FAIL] delete {record.url}: {exc}")
-                    raise
-                state.mark_deleted(record.url)
-                counts.deleted += 1
-                print(f"[OK] moved to trash: {record.url}")
-        finally:
-            await page.close()
+        while not pending.empty():
+            record = pending.get_nowait()
+            # Fresh tab per item: a click that Playwright gave up on can
+            # still land late, and in a reused tab it hit the next photo's
+            # viewer and navigated it to a different photo.
+            page = await browser.new_item_page()
+            try:
+                await browser.move_to_trash(page, record.url)
+            except Exception as exc:
+                # Stop everything on the first failure (TaskGroup
+                # cancels the other workers).
+                print(f"[FAIL] delete {record.url}: {exc}")
+                raise
+            finally:
+                await page.close()
+            state.mark_deleted(record.url)
+            counts.deleted += 1
+            print(f"[OK] moved to trash: {record.url}")
 
     async with asyncio.TaskGroup() as group:
         for _ in range(min(workers, len(records))):
