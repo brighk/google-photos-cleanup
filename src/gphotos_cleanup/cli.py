@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from .app import run
-from .browser import open_login_browser
+from .browser import find_chrome, open_login_browser
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,6 +26,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help="Persistent Chromium profile directory.",
+    )
+    parser.add_argument(
+        "--chrome",
+        type=Path,
+        help=(
+            "Path to Google Chrome (the binary, or Google Chrome.app on "
+            "macOS). Found automatically if omitted."
+        ),
     )
     parser.add_argument(
         "--delete",
@@ -66,13 +74,15 @@ def main() -> None:
     if not 1 <= args.workers <= 16:
         parser.error("--workers must be between 1 and 16")
 
+    chrome = find_chrome(args.chrome)
     if args.login:
-        open_login_browser(args.profile.expanduser().resolve())
+        open_login_browser(args.profile.expanduser().resolve(), chrome)
         return
 
     result = run(
         output_dir=args.output.expanduser().resolve(),
         profile_dir=args.profile.expanduser().resolve(),
+        chrome=chrome,
         delete=args.delete,
         headless=args.headless,
         workers=args.workers,

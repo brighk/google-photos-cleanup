@@ -30,6 +30,7 @@ def run(
     *,
     output_dir: Path,
     profile_dir: Path,
+    chrome: str,
     delete: bool,
     headless: bool,
     workers: int = 4,
@@ -38,6 +39,7 @@ def run(
         _run(
             output_dir=output_dir,
             profile_dir=profile_dir,
+            chrome=chrome,
             delete=delete,
             headless=headless,
             workers=workers,
@@ -49,6 +51,7 @@ async def _run(
     *,
     output_dir: Path,
     profile_dir: Path,
+    chrome: str,
     delete: bool,
     headless: bool,
     workers: int,
@@ -60,6 +63,7 @@ async def _run(
     async with GooglePhotosBrowser(
         profile_dir=profile_dir,
         output_dir=output_dir,
+        chrome=chrome,
         headless=headless,
     ) as browser:
         await browser.ensure_logged_in()
@@ -79,9 +83,16 @@ async def _run(
             page = await browser.new_item_page()
             try:
                 while (media_url := await queue.get()) is not None:
-                    await _download_one(browser, page, state, counts, media_url)
+                    # A tab whose renderer crashed fails every later call, so
+                    # swap in a new one and give the item one more try.
+                    for can_retry in (True, False):
+                        page = await browser.replace_if_crashed(page)
+                        if not await _download_one(
+                            browser, page, state, counts, media_url, can_retry
+                        ):
+                            break
             finally:
-                await page.close()
+                await browser.close_item_page(page)
 
         # TaskGroup cancels the other tasks if any of them raises.
         async with asyncio.TaskGroup() as group:
@@ -106,7 +117,9 @@ async def _download_one(
     state: StateStore,
     counts: _Counters,
     media_url: str,
-) -> None:
+    can_retry: bool = False,
+) -> bool:
+    """Returns True if the tab crashed and the caller should retry."""
     previous = state.get(media_url)
     if previous is not None and previous.deleted:
         # Trashed items don't show in the Photos grid, so this one was
@@ -122,7 +135,7 @@ async def _download_one(
         local_path = Path(previous.local_path)
         if previous.verified and verify_file(local_path):
             counts.skipped += 1
-            return
+            return False
 
     try:
         local_path = await browser.download_media(page, media_url)
@@ -138,13 +151,17 @@ async def _download_one(
         if not verified:
             counts.failed += 1
             _report_failure(state, f"verification failed: {media_url}")
-            return
+            return False
 
         counts.downloaded += 1
         print(f"[OK] downloaded: {local_path}")
     except Exception as exc:
+        if can_retry and browser.is_crashed(page):
+            print(f"[RETRY] tab crashed, retrying in a new tab: {media_url}")
+            return True
         counts.failed += 1
         _report_failure(state, f"download {media_url}: {exc}")
+    return False
 
 
 def _report_failure(state: StateStore, message: str) -> None:
@@ -196,7 +213,7 @@ async def _delete_all(
                 print(f"[FAIL] delete {record.url}: {exc}")
                 raise
             finally:
-                await page.close()
+                await browser.close_item_page(page)
             state.mark_deleted(record.url)
             counts.deleted += 1
             print(f"[OK] moved to trash: {record.url}")

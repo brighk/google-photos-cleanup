@@ -27,7 +27,8 @@ playwright install chromium
 ## First login
 
 Google blocks sign-in from automated browsers ("This browser or app may not be
-secure"), so log in once with plain Google Chrome (must be installed):
+secure"), so log in once with plain Google Chrome (must be installed; it is found
+automatically on macOS and Linux, or pass `--chrome /path/to/chrome`):
 
 ```bash
 gphotos-cleanup \
@@ -36,7 +37,7 @@ gphotos-cleanup \
   --login
 ```
 
-Sign in to Google in the Chrome window that opens, then quit Chrome (Cmd+Q).
+Sign in to Google in the Chrome window that opens, then quit Chrome (Cmd+Q on macOS, close the window on Linux).
 The session is saved in the profile directory and reused by later runs.
 
 ## Download only

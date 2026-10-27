@@ -4,7 +4,9 @@ import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import sys
 import time
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
@@ -48,10 +50,63 @@ DOWNLOAD_MENU_LABEL = re.compile(r"^\s*(download|изтегляне)\b", re.I)
 DOWNLOAD_TIMEOUT_S = 300
 MORE_LABEL = re.compile(r"more options|\bmore\b|още опции", re.I)
 
-CHROME_PATH = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+MACOS_CHROME_APP = "Google Chrome.app"
+MACOS_CHROME_BINARY = "Contents/MacOS/Google Chrome"
+MACOS_CHROME_BUNDLE_ID = "com.google.Chrome"
+# The real binary first: /usr/bin/google-chrome* are wrapper scripts.
+LINUX_CHROME_PATHS = ("/opt/google/chrome/chrome",)
+LINUX_CHROME_NAMES = ("google-chrome-stable", "google-chrome")
 
 
-def open_login_browser(profile_dir: Path) -> None:
+def find_chrome(override: Path | None = None) -> str:
+    """
+    Path to the installed Google Chrome. Login and automated runs must use
+    the same Chrome, since they share one profile. Only Google Chrome, not
+    Chromium: on macOS the profile's cookies are encrypted with a keychain
+    entry that is specific to the browser.
+    """
+    if override is not None:
+        path = override.expanduser()
+        if path.is_dir():
+            # Accept the .app bundle itself on macOS.
+            path = path / MACOS_CHROME_BINARY
+        if not path.is_file():
+            raise SystemExit(f"Chrome not found at {path}.")
+        return str(path)
+
+    if sys.platform == "darwin":
+        candidates = [
+            Path("/Applications") / MACOS_CHROME_APP,
+            Path.home() / "Applications" / MACOS_CHROME_APP,
+        ]
+        # Spotlight finds Chrome installed anywhere else.
+        try:
+            found = subprocess.run(
+                ["mdfind", f"kMDItemCFBundleIdentifier == '{MACOS_CHROME_BUNDLE_ID}'"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+            candidates += [Path(line) for line in found.splitlines() if line]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        for app in candidates:
+            if (app / MACOS_CHROME_BINARY).is_file():
+                return str(app / MACOS_CHROME_BINARY)
+    else:
+        for path in LINUX_CHROME_PATHS:
+            if Path(path).is_file():
+                return path
+        for name in LINUX_CHROME_NAMES:
+            if found := shutil.which(name):
+                return found
+
+    raise SystemExit(
+        "Google Chrome not found. Install it, or pass its path with --chrome."
+    )
+
+
+def open_login_browser(profile_dir: Path, chrome: str) -> None:
     """
     Launch plain Chrome (no automation attached) on the tool's profile so the
     user can sign in to Google. Blocks until the window is closed.
@@ -59,8 +114,11 @@ def open_login_browser(profile_dir: Path) -> None:
     profile_dir.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         [
-            CHROME_PATH,
+            chrome,
             f"--user-data-dir={profile_dir}",
+            # Match Playwright's default so later runs can decrypt the cookies
+            # (on Linux, plain Chrome would otherwise use the system keyring).
+            "--password-store=basic",
             "--no-first-run",
             "--no-default-browser-check",
             LOGIN_URL,
@@ -98,10 +156,12 @@ class GooglePhotosBrowser:
         profile_dir: Path,
         output_dir: Path,
         *,
+        chrome: str,
         headless: bool = False,
     ) -> None:
         self.profile_dir = profile_dir
         self.output_dir = output_dir
+        self.chrome = chrome
         self.headless = headless
         self._playwright: Playwright | None = None
         self.context: BrowserContext | None = None
@@ -111,6 +171,9 @@ class GooglePhotosBrowser:
         # Destinations picked for downloads still in flight, so two concurrent
         # downloads named e.g. IMG_0001.jpg don't pick the same file.
         self._reserved: set[Path] = set()
+        # Item pages whose renderer crashed. A crashed page fails every later
+        # call, so workers replace it (see replace_if_crashed).
+        self._crashed: set[Page] = set()
 
     async def __aenter__(self) -> "GooglePhotosBrowser":
         self.profile_dir.mkdir(parents=True, exist_ok=True)
@@ -123,7 +186,7 @@ class GooglePhotosBrowser:
         # Chrome session (see open_login_browser).
         self.context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(self.profile_dir),
-            channel="chrome",
+            executable_path=self.chrome,
             headless=self.headless,
             accept_downloads=True,
             ignore_default_args=["--enable-automation", "--use-mock-keychain"],
@@ -144,7 +207,24 @@ class GooglePhotosBrowser:
     async def new_item_page(self) -> Page:
         if self.context is None:
             raise RuntimeError("Browser is not running")
-        return await self.context.new_page()
+        page = await self.context.new_page()
+        # Playwright tags handlers with an attribute, so a builtin like
+        # set.add can't be passed directly.
+        page.on("crash", lambda crashed: self._crashed.add(crashed))
+        return page
+
+    def is_crashed(self, page: Page) -> bool:
+        return page in self._crashed
+
+    async def close_item_page(self, page: Page) -> None:
+        self._crashed.discard(page)
+        await page.close()
+
+    async def replace_if_crashed(self, page: Page) -> Page:
+        if not self.is_crashed(page):
+            return page
+        await self.close_item_page(page)
+        return await self.new_item_page()
 
     async def ensure_logged_in(self, timeout_s: int = 300) -> None:
         page = self._require_page()
@@ -293,6 +373,10 @@ class GooglePhotosBrowser:
         finally:
             if not waiter.done():
                 waiter.cancel()
+            elif not waiter.cancelled():
+                # Retrieve it so a failure here (e.g. the page crashed) isn't
+                # also logged as "Task exception was never retrieved".
+                waiter.exception()
 
         destination = self._reserve_download_path(download)
         try:
