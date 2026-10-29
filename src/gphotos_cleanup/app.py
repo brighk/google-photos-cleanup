@@ -107,9 +107,16 @@ async def _download_all(
         page = await browser.new_item_page()
         try:
             while (media_url := await queue.get()) is not None:
-                await _download_one(browser, page, state, counts, media_url)
+                # A tab whose renderer crashed fails every later call, so
+                # swap in a new one and give the item one more try.
+                for can_retry in (True, False):
+                    page = await browser.replace_if_crashed(page)
+                    if not await _download_one(
+                        browser, page, state, counts, media_url, can_retry
+                    ):
+                        break
         finally:
-            await page.close()
+            await browser.close_item_page(page)
 
     # TaskGroup cancels the other tasks if any of them raises.
     async with asyncio.TaskGroup() as group:

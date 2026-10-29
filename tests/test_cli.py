@@ -9,6 +9,12 @@ def _fail_run(**kwargs):
     raise AssertionError("run() must not be called")
 
 
+@pytest.fixture(autouse=True)
+def _no_chrome_lookup(monkeypatch) -> None:
+    # main() looks for an installed Chrome; tests must not depend on one.
+    monkeypatch.setattr(cli, "find_chrome", lambda override: "/fake/chrome")
+
+
 def test_delete_and_delete_all_conflict(monkeypatch) -> None:
     monkeypatch.setattr("sys.argv", BASE_ARGS + ["--delete", "--delete-all"])
     monkeypatch.setattr(cli, "run", _fail_run)
