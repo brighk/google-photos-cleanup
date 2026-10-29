@@ -6,6 +6,8 @@ from pathlib import Path
 from .app import run
 from .browser import find_chrome, open_login_browser
 
+DELETE_ALL_PHRASE = "trash everything"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -44,6 +46,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--delete-all",
+        action="store_true",
+        help=(
+            "Move EVERY item in the Google Photos library to Trash. Nothing "
+            "is downloaded or checked first. Asks for confirmation unless "
+            "--yes is given."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the --delete-all confirmation prompt.",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Run Chrome headlessly. Log in once with --login first.",
@@ -68,15 +84,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _confirm_delete_all() -> bool:
+    print(
+        "--delete-all moves EVERY photo and video in your Google Photos "
+        "library to Trash.\nNothing is downloaded or checked first. Google "
+        "deletes trashed items permanently after a while."
+    )
+    try:
+        answer = input(f'Type "{DELETE_ALL_PHRASE}" to continue: ')
+    except EOFError:
+        return False
+    return answer.strip() == DELETE_ALL_PHRASE
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     if not 1 <= args.workers <= 16:
         parser.error("--workers must be between 1 and 16")
+    if args.delete and args.delete_all:
+        parser.error("use either --delete or --delete-all, not both")
 
     chrome = find_chrome(args.chrome)
     if args.login:
         open_login_browser(args.profile.expanduser().resolve(), chrome)
+        return
+
+    if args.delete_all and not args.yes and not _confirm_delete_all():
+        print("Cancelled. Nothing was moved to Trash.")
         return
 
     result = run(
@@ -86,6 +121,7 @@ def main() -> None:
         delete=args.delete,
         headless=args.headless,
         workers=args.workers,
+        delete_all=args.delete_all,
     )
 
     print()

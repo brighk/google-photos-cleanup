@@ -34,6 +34,7 @@ def run(
     delete: bool,
     headless: bool,
     workers: int = 4,
+    delete_all: bool = False,
 ) -> RunResult:
     return asyncio.run(
         _run(
@@ -43,6 +44,7 @@ def run(
             delete=delete,
             headless=headless,
             workers=workers,
+            delete_all=delete_all,
         )
     )
 
@@ -55,6 +57,7 @@ async def _run(
     delete: bool,
     headless: bool,
     workers: int,
+    delete_all: bool,
 ) -> RunResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     state = StateStore(output_dir / ".gphotos-cleanup-state.json")
@@ -68,40 +71,12 @@ async def _run(
     ) as browser:
         await browser.ensure_logged_in()
 
-        # The grid scroller feeds URLs into a bounded queue; each worker owns
-        # one tab and downloads from it. All of this runs on one event loop
-        # thread, so state and counters need no locking.
-        queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=workers * 2)
-
-        async def produce() -> None:
-            async for media_url in browser.iter_media_urls():
-                await queue.put(media_url)
-            for _ in range(workers):
-                await queue.put(None)
-
-        async def download_worker() -> None:
-            page = await browser.new_item_page()
-            try:
-                while (media_url := await queue.get()) is not None:
-                    # A tab whose renderer crashed fails every later call, so
-                    # swap in a new one and give the item one more try.
-                    for can_retry in (True, False):
-                        page = await browser.replace_if_crashed(page)
-                        if not await _download_one(
-                            browser, page, state, counts, media_url, can_retry
-                        ):
-                            break
-            finally:
-                await browser.close_item_page(page)
-
-        # TaskGroup cancels the other tasks if any of them raises.
-        async with asyncio.TaskGroup() as group:
-            group.create_task(produce())
-            for _ in range(workers):
-                group.create_task(download_worker())
-
-        if delete:
-            await _delete_all(browser, state, counts, workers)
+        if delete_all:
+            await _trash_everything(browser, state, counts)
+        else:
+            await _download_all(browser, state, counts, workers)
+            if delete:
+                await _delete_all(browser, state, counts, workers)
 
     return RunResult(
         downloaded=counts.downloaded,
@@ -109,6 +84,54 @@ async def _run(
         failed=counts.failed,
         deleted=counts.deleted,
     )
+
+
+async def _download_all(
+    browser: GooglePhotosBrowser,
+    state: StateStore,
+    counts: _Counters,
+    workers: int,
+) -> None:
+    # The grid scroller feeds URLs into a bounded queue; each worker owns
+    # one tab and downloads from it. All of this runs on one event loop
+    # thread, so state and counters need no locking.
+    queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=workers * 2)
+
+    async def produce() -> None:
+        async for media_url in browser.iter_media_urls():
+            await queue.put(media_url)
+        for _ in range(workers):
+            await queue.put(None)
+
+    async def download_worker() -> None:
+        page = await browser.new_item_page()
+        try:
+            while (media_url := await queue.get()) is not None:
+                await _download_one(browser, page, state, counts, media_url)
+        finally:
+            await page.close()
+
+    # TaskGroup cancels the other tasks if any of them raises.
+    async with asyncio.TaskGroup() as group:
+        group.create_task(produce())
+        for _ in range(workers):
+            group.create_task(download_worker())
+
+
+async def _trash_everything(
+    browser: GooglePhotosBrowser,
+    state: StateStore,
+    counts: _Counters,
+) -> None:
+    # --delete-all: no downloads and no local checks, by design.
+    def record(urls: list[str]) -> None:
+        for url in urls:
+            # Only items a previous download run saw have a record.
+            if state.get(url) is not None:
+                state.mark_deleted(url)
+        counts.deleted += len(urls)
+
+    await browser.trash_all(record)
 
 
 async def _download_one(

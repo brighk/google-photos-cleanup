@@ -63,6 +63,21 @@ gphotos-cleanup \
   --delete
 ```
 
+## Move everything to Trash, without downloading
+
+```bash
+gphotos-cleanup \
+  --output ~/Pictures/google-photos \
+  --profile ~/.config/gphotos-cleanup/chromium \
+  --delete-all
+```
+
+This downloads nothing and checks nothing. It selects items in the Photos grid,
+200 at a time, and moves each selection to Trash until the library is empty.
+Before each batch is trashed, Google's "N selected" count must match the number
+of items the tool ticked. The tool asks you to type `trash everything` first.
+`--yes` skips that prompt. It cannot be combined with `--delete`.
+
 ## Behavior
 
 The tool:

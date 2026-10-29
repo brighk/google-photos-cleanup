@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import aclosing
 from pathlib import Path
 import re
 import shutil
@@ -42,6 +43,11 @@ TRASH_CONFIRM_LABEL = re.compile(
     r"|изтриване)\s*$",
     re.I,
 )
+# The grid's top bar while items are selected, e.g. "3 selected".
+SELECTED_COUNT = re.compile(r"^\s*(\d+)\s+(selected|избран[иа]?)\s*$", re.I)
+# Items trashed per grid selection by trash_all. A wrong click or a lost
+# selection costs at most one batch.
+TRASH_BATCH = 200
 # Large videos: Google shows "Downloading..." while it prepares the file, and
 # the browser download can start well after 15 s.
 PREPARING_DOWNLOAD = re.compile(r"^\s*(downloading|изтегля)", re.I)
@@ -434,7 +440,10 @@ class GooglePhotosBrowser:
             self._assert_on_item(page, media_url)
             await _click_lenient(item.first)
 
-        await self._confirm_trash(page, media_url, item_id)
+        async def left_item() -> bool:
+            return item_id not in page.url
+
+        await self._confirm_trash(page, media_url, left_item)
 
         # After trashing, the viewer moves to the next item or back to the
         # grid. Still showing this item means the trash didn't happen.
@@ -449,14 +458,14 @@ class GooglePhotosBrowser:
             ) from None
 
     async def _confirm_trash(
-        self, page: Page, media_url: str, item_id: str
+        self, page: Page, what: str, gone: Callable[[], Awaitable[bool]]
     ) -> None:
         """
         Click through Google's trash dialogs. Currently there are two in a
         row: a "Moving items to trash" notice ("Got it", possibly shown only
         once) and a "Remove from your Google Account?" box ("Move to trash").
-        Stops as soon as the item leaves the viewer; move_to_trash then
-        double-checks that.
+        Stops as soon as gone() reports the items left the page; the caller
+        then double-checks that. `what` names the items in error messages.
         """
         dialog = (
             page.locator('[role="dialog"], [role="alertdialog"]')
@@ -468,13 +477,13 @@ class GooglePhotosBrowser:
             # that, give a follow-up dialog a few seconds to appear.
             deadline = time.monotonic() + (5 if step == 0 else 3)
             while await dialog.count() == 0:
-                if item_id not in page.url:
+                if await gone():
                     return
                 if time.monotonic() > deadline:
                     if step == 0:
                         raise RuntimeError(
                             "Neither a trash dialog appeared nor did the "
-                            f"photo close for {media_url}. "
+                            f"page change for {what}. "
                             + await self._debug_hint(page)
                         )
                     return
@@ -486,7 +495,7 @@ class GooglePhotosBrowser:
             if await confirm.count() == 0:
                 raise RuntimeError(
                     f"Could not find the confirm button in the trash dialog "
-                    f"for {media_url}. " + await self._debug_hint(page)
+                    f"for {what}. " + await self._debug_hint(page)
                 )
             await _click_lenient(confirm.last)
 
@@ -502,14 +511,127 @@ class GooglePhotosBrowser:
                 )
             except PlaywrightTimeoutError:
                 raise RuntimeError(
-                    f"Trash dialog for {media_url} stayed open after "
+                    f"Trash dialog for {what} stayed open after "
                     "confirming. " + await self._debug_hint(page)
                 ) from None
 
         raise RuntimeError(
-            f"Too many trash dialogs for {media_url}. "
+            f"Too many trash dialogs for {what}. "
             + await self._debug_hint(page)
         )
+
+    async def trash_all(self, on_trashed: Callable[[list[str]], None]) -> None:
+        """
+        Move every item in the library to Trash from the grid, without
+        opening or downloading anything. Works in batches of TRASH_BATCH:
+        tick items from the top of the grid, check Google's "N selected"
+        count, trash the selection, reload. Ends when the grid is empty.
+        Calls on_trashed with each batch's URLs once Google confirms it.
+        """
+        page = self._require_page()
+        trashed: set[str] = set()
+        while True:
+            batch = await self._select_batch(page, TRASH_BATCH, trashed)
+            if not batch:
+                return
+            await self._trash_selection(page, len(batch))
+            trashed.update(batch)
+            on_trashed(batch)
+            print(f"[OK] moved {len(batch)} item(s) to trash ({len(trashed)} so far)")
+
+    async def _select_batch(
+        self, page: Page, limit: int, trashed: set[str]
+    ) -> list[str]:
+        """Tick up to `limit` items from the top of the grid; return their URLs."""
+        selected: list[str] = []
+        # iter_media_urls reloads the grid and scrolls it; ticking happens
+        # while it is paused at a yield, so the tile is still on screen.
+        async with aclosing(self.iter_media_urls()) as media_urls:
+            async for media_url in media_urls:
+                # Trashed items leave the grid. Seeing one again means the
+                # trash didn't take, and the next batch would repeat forever.
+                if media_url in trashed:
+                    raise RuntimeError(
+                        f"{media_url} is still in the grid after being "
+                        "trashed. Stopping."
+                    )
+                await self._select_tile(page, media_url)
+                selected.append(media_url)
+                if len(selected) >= limit:
+                    break
+
+        if not selected:
+            return selected
+
+        # Google's own count must match what we ticked, or the selection
+        # holds something we didn't mean to trash.
+        label = page.get_by_text(SELECTED_COUNT).filter(visible=True)
+        shown: int | None = None
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if await label.count() > 0:
+                match = SELECTED_COUNT.match(await label.first.inner_text())
+                shown = int(match.group(1)) if match else None
+                if shown == len(selected):
+                    return selected
+            await page.wait_for_timeout(200)
+        raise RuntimeError(
+            f"Ticked {len(selected)} item(s) but Google shows {shown} "
+            "selected. Nothing was trashed. " + await self._debug_hint(page)
+        )
+
+    async def _select_tile(self, page: Page, media_url: str) -> None:
+        tile = page.locator(f'a[href*="{_item_id(media_url)}"]').first
+        await tile.hover()
+        # The tile's own box is the nearest ancestor holding a checkbox. It
+        # must hold just this one item, so a date header's "select all"
+        # checkbox can never be the one clicked.
+        box = tile.locator('xpath=ancestor::*[.//*[@role="checkbox"]][1]')
+        checkbox = box.locator('[role="checkbox"]')
+        items = box.locator('a[href*="/photo/"], a[href*="/video/"]')
+        if await checkbox.count() != 1 or await items.count() != 1:
+            raise RuntimeError(
+                f"Could not find the selection checkbox for {media_url}. "
+                + await self._debug_hint(page)
+            )
+
+        if await checkbox.get_attribute("aria-checked") != "true":
+            await _click_lenient(checkbox)
+        deadline = time.monotonic() + 3
+        while await checkbox.get_attribute("aria-checked") != "true":
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"Could not select {media_url}. "
+                    + await self._debug_hint(page)
+                )
+            await page.wait_for_timeout(100)
+
+    async def _trash_selection(self, page: Page, count: int) -> None:
+        what = f"{count} selected item(s)"
+        button = page.get_by_role("button", name=TRASH_LABEL).filter(
+            visible=True
+        )
+        if await button.count() == 0:
+            raise RuntimeError(
+                f"Could not find the trash button for {what}. "
+                + await self._debug_hint(page)
+            )
+        await _click_lenient(button.first)
+
+        # The "N selected" bar closes once Google has trashed the items.
+        selection = page.get_by_text(SELECTED_COUNT).filter(visible=True)
+
+        async def cleared() -> bool:
+            return await selection.count() == 0
+
+        await self._confirm_trash(page, what, cleared)
+        try:
+            await selection.first.wait_for(state="hidden", timeout=60_000)
+        except PlaywrightTimeoutError:
+            raise RuntimeError(
+                f"Trash was not confirmed for {what}: the selection is still "
+                "open after confirming. " + await self._debug_hint(page)
+            ) from None
 
     async def _open_item(self, page: Page, media_url: str) -> None:
         await page.goto(_with_english(media_url), wait_until="domcontentloaded")
