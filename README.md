@@ -16,13 +16,25 @@ It does **not** empty Google Photos Trash.
 
 ## Install
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
+Requires [uv](https://docs.astral.sh/uv/).
 
-pip install -e .
-playwright install chromium
+```bash
+uv sync
+uv run playwright install chromium
 ```
+
+Run the tool with `uv run gphotos-cleanup ...`, or activate the environment
+once with `source .venv/bin/activate` and use the commands below as written.
+
+## Development
+
+```bash
+uv run pre-commit install        # run the checks on every commit
+uv run pre-commit run --all-files
+```
+
+The hooks run ruff (lint and format), pyright and pytest. Each tool's version
+comes from `uv.lock`.
 
 ## First login
 

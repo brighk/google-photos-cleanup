@@ -16,7 +16,7 @@ def _no_chrome_lookup(monkeypatch) -> None:
 
 
 def test_delete_and_delete_all_conflict(monkeypatch) -> None:
-    monkeypatch.setattr("sys.argv", BASE_ARGS + ["--delete", "--delete-all"])
+    monkeypatch.setattr("sys.argv", [*BASE_ARGS, "--delete", "--delete-all"])
     monkeypatch.setattr(cli, "run", _fail_run)
 
     with pytest.raises(SystemExit):
@@ -24,7 +24,7 @@ def test_delete_and_delete_all_conflict(monkeypatch) -> None:
 
 
 def test_delete_all_cancelled_without_phrase(monkeypatch) -> None:
-    monkeypatch.setattr("sys.argv", BASE_ARGS + ["--delete-all"])
+    monkeypatch.setattr("sys.argv", [*BASE_ARGS, "--delete-all"])
     monkeypatch.setattr("builtins.input", lambda prompt: "yes")
     monkeypatch.setattr(cli, "run", _fail_run)
 
@@ -33,7 +33,7 @@ def test_delete_all_cancelled_without_phrase(monkeypatch) -> None:
 
 def test_delete_all_runs_after_phrase(monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr("sys.argv", BASE_ARGS + ["--delete-all"])
+    monkeypatch.setattr("sys.argv", [*BASE_ARGS, "--delete-all"])
     monkeypatch.setattr("builtins.input", lambda prompt: cli.DELETE_ALL_PHRASE)
     monkeypatch.setattr(
         cli, "run", lambda **kwargs: calls.append(kwargs) or _empty_result()
@@ -47,7 +47,7 @@ def test_delete_all_runs_after_phrase(monkeypatch) -> None:
 
 def test_delete_all_yes_skips_prompt(monkeypatch) -> None:
     calls = []
-    monkeypatch.setattr("sys.argv", BASE_ARGS + ["--delete-all", "--yes"])
+    monkeypatch.setattr("sys.argv", [*BASE_ARGS, "--delete-all", "--yes"])
     monkeypatch.setattr("builtins.input", _fail_run)
     monkeypatch.setattr(
         cli, "run", lambda **kwargs: calls.append(kwargs) or _empty_result()

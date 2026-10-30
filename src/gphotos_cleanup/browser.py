@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing
 from pathlib import Path
 import re
@@ -17,14 +17,14 @@ from playwright.async_api import (
     Locator,
     Page,
     Playwright,
-    TimeoutError as PlaywrightTimeoutError,
     async_playwright,
+)
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeoutError,
 )
 
 PHOTOS_URL = "https://photos.google.com/"
-LOGIN_URL = (
-    "https://accounts.google.com/ServiceLogin?continue=" + PHOTOS_URL
-)
+LOGIN_URL = "https://accounts.google.com/ServiceLogin?continue=" + PHOTOS_URL
 
 
 # Button labels are localized; the account's language wins over the browser's.
@@ -38,13 +38,17 @@ TRASH_LABEL = re.compile(
 ALREADY_TRASHED = re.compile(r"until permanently deleted", re.I)
 # Google's trash dialog ("Moving items to trash") confirms with "Got it".
 TRASH_DIALOG_TEXT = re.compile(r"trash|кошче", re.I)
+# "Got it, continue" is on the notice that trash now keeps items 30 days.
 TRASH_CONFIRM_LABEL = re.compile(
-    r"^\s*(got it|move to trash|delete|разбрах|преместване в кошчето"
-    r"|изтриване)\s*$",
+    r"^\s*(got it(, continue)?|move to trash|delete|разбрах(, продълж\w*)?"
+    r"|преместване в кошчето|изтриване)\s*$",
     re.I,
 )
 # The grid's top bar while items are selected, e.g. "3 selected".
-SELECTED_COUNT = re.compile(r"^\s*(\d+)\s+(selected|избран[иа]?)\s*$", re.I)
+# Bulgarian may put the number first or last ("3 избрани", "Избрани: 3").
+SELECTED_COUNT = re.compile(
+    r"^\s*(?:(\d+)\s+(?:selected|избран\w*)|избран\w*:?\s+(\d+))\s*$", re.I
+)
 # Items trashed per grid selection by trash_all. A wrong click or a lost
 # selection costs at most one batch.
 TRASH_BATCH = 200
@@ -181,7 +185,7 @@ class GooglePhotosBrowser:
         # call, so workers replace it (see replace_if_crashed).
         self._crashed: set[Page] = set()
 
-    async def __aenter__(self) -> "GooglePhotosBrowser":
+    async def __aenter__(self) -> GooglePhotosBrowser:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -264,7 +268,7 @@ class GooglePhotosBrowser:
     def _on_photos(page: Page) -> bool:
         return page.url.startswith(PHOTOS_URL)
 
-    async def iter_media_urls(self) -> AsyncIterator[str]:
+    async def iter_media_urls(self) -> AsyncGenerator[str]:
         """
         Scroll the main Photos view and yield unique media item URLs.
 
@@ -276,7 +280,7 @@ class GooglePhotosBrowser:
         while.
         """
         page = self._require_page()
-        await page.goto(PHOTOS_URL, wait_until="domcontentloaded")
+        await page.goto(_with_english(PHOTOS_URL), wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
 
         seen: set[str] = set()
@@ -360,9 +364,7 @@ class GooglePhotosBrowser:
                 await asyncio.sleep(0.5)
                 if used_menu or time.monotonic() < fallback_at:
                     continue
-                preparing = page.get_by_text(PREPARING_DOWNLOAD).filter(
-                    visible=True
-                )
+                preparing = page.get_by_text(PREPARING_DOWNLOAD).filter(visible=True)
                 if await preparing.count() > 0:
                     # Google is still preparing it; keep waiting.
                     continue
@@ -419,9 +421,7 @@ class GooglePhotosBrowser:
             return
 
         # Prefer a directly exposed trash/delete button if present.
-        direct = page.get_by_role("button", name=TRASH_LABEL).filter(
-            visible=True
-        )
+        direct = page.get_by_role("button", name=TRASH_LABEL).filter(visible=True)
         # Re-check right before acting: the URL check in _open_item is the
         # only proof the viewer shows this item, and later checks rely on it.
         self._assert_on_item(page, media_url)
@@ -429,9 +429,7 @@ class GooglePhotosBrowser:
             await _click_lenient(direct.first)
         else:
             await self._open_more_menu(page)
-            item = page.get_by_role("menuitem", name=TRASH_LABEL).filter(
-                visible=True
-            )
+            item = page.get_by_role("menuitem", name=TRASH_LABEL).filter(visible=True)
             if await item.count() == 0:
                 raise RuntimeError(
                     f"Could not find trash/delete action for {media_url}. "
@@ -483,8 +481,7 @@ class GooglePhotosBrowser:
                     if step == 0:
                         raise RuntimeError(
                             "Neither a trash dialog appeared nor did the "
-                            f"page change for {what}. "
-                            + await self._debug_hint(page)
+                            f"page change for {what}. " + await self._debug_hint(page)
                         )
                     return
                 await page.wait_for_timeout(200)
@@ -516,8 +513,7 @@ class GooglePhotosBrowser:
                 ) from None
 
         raise RuntimeError(
-            f"Too many trash dialogs for {what}. "
-            + await self._debug_hint(page)
+            f"Too many trash dialogs for {what}. " + await self._debug_hint(page)
         )
 
     async def trash_all(self, on_trashed: Callable[[list[str]], None]) -> None:
@@ -571,7 +567,7 @@ class GooglePhotosBrowser:
         while time.monotonic() < deadline:
             if await label.count() > 0:
                 match = SELECTED_COUNT.match(await label.first.inner_text())
-                shown = int(match.group(1)) if match else None
+                shown = int(match.group(1) or match.group(2)) if match else None
                 if shown == len(selected):
                     return selected
             await page.wait_for_timeout(200)
@@ -582,35 +578,50 @@ class GooglePhotosBrowser:
 
     async def _select_tile(self, page: Page, media_url: str) -> None:
         tile = page.locator(f'a[href*="{_item_id(media_url)}"]').first
-        await tile.hover()
         # The tile's own box is the nearest ancestor holding a checkbox. It
         # must hold just this one item, so a date header's "select all"
         # checkbox can never be the one clicked.
         box = tile.locator('xpath=ancestor::*[.//*[@role="checkbox"]][1]')
         checkbox = box.locator('[role="checkbox"]')
         items = box.locator('a[href*="/photo/"], a[href*="/video/"]')
-        if await checkbox.count() != 1 or await items.count() != 1:
+        # Google labels the checkbox like the link ("Photo - Portrait -
+        # <date>"); a different label means it belongs to something else.
+        if (
+            await checkbox.count() != 1
+            or await items.count() != 1
+            or await checkbox.get_attribute("aria-label")
+            != await tile.get_attribute("aria-label")
+        ):
             raise RuntimeError(
                 f"Could not find the selection checkbox for {media_url}. "
                 + await self._debug_hint(page)
             )
 
-        if await checkbox.get_attribute("aria-checked") != "true":
-            await _click_lenient(checkbox)
-        deadline = time.monotonic() + 3
-        while await checkbox.get_attribute("aria-checked") != "true":
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f"Could not select {media_url}. "
-                    + await self._debug_hint(page)
-                )
-            await page.wait_for_timeout(100)
+        async def checked(timeout_s: float) -> bool:
+            deadline = time.monotonic() + timeout_s
+            while await checkbox.get_attribute("aria-checked") != "true":
+                if time.monotonic() > deadline:
+                    return False
+                await page.wait_for_timeout(100)
+            return True
+
+        if await checkbox.get_attribute("aria-checked") == "true":
+            return
+        # The checkbox lies on top of the link, so it is clicked directly;
+        # hovering the link never succeeds. A hover overlay sometimes takes
+        # the click instead, so then send it to the checkbox element itself.
+        await _click_lenient(checkbox)
+        if await checked(1.5):
+            return
+        await checkbox.dispatch_event("click")
+        if not await checked(3):
+            raise RuntimeError(
+                f"Could not select {media_url}. " + await self._debug_hint(page)
+            )
 
     async def _trash_selection(self, page: Page, count: int) -> None:
         what = f"{count} selected item(s)"
-        button = page.get_by_role("button", name=TRASH_LABEL).filter(
-            visible=True
-        )
+        button = page.get_by_role("button", name=TRASH_LABEL).filter(visible=True)
         if await button.count() == 0:
             raise RuntimeError(
                 f"Could not find the trash button for {what}. "
@@ -699,13 +710,16 @@ class GooglePhotosBrowser:
         labels: list[str] = []
         buttons = page.locator('[role="button"], button').filter(visible=True)
         for idx in range(min(await buttons.count(), 40)):
-            label = await buttons.nth(idx).get_attribute("aria-label")
+            button = buttons.nth(idx)
+            # Dialog buttons often have only text, no aria-label.
+            label = await button.get_attribute("aria-label") or (
+                (await button.inner_text()).strip()
+            )
             if label and label not in labels:
                 labels.append(label)
 
-        return (
-            f"Visible buttons: {labels}. "
-            + (f"Screenshot: {shot}" if shot else "Screenshot failed.")
+        return f"Visible buttons: {labels}. " + (
+            f"Screenshot: {shot}" if shot else "Screenshot failed."
         )
 
     def _reserve_download_path(self, download: Download) -> Path:

@@ -30,9 +30,7 @@ class StateStore:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "items": [asdict(record) for record in self._records.values()]
-        }
+        payload = {"items": [asdict(record) for record in self._records.values()]}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(
             json.dumps(payload, indent=2, sort_keys=True),
