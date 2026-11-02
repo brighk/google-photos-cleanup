@@ -50,6 +50,9 @@ force-sort-within-sections = true
 [tool.pyright]
 include = ["src", "tests"]
 pythonVersion = "3.11"
+# Check the macOS and Linux branches of sys.platform tests, not only the
+# branch for the machine pyright happens to run on.
+pythonPlatform = "All"
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"

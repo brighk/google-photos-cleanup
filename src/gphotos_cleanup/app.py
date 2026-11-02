@@ -138,7 +138,11 @@ async def _trash_everything(
                 state.mark_deleted(url)
         counts.deleted += len(urls)
 
-    await browser.trash_all(record)
+    skipped = await browser.trash_all(record)
+    # Never ticked, so never trashed: they are still in the library.
+    for url, reason in skipped.items():
+        counts.failed += 1
+        _report_failure(state, f"left in library, could not select {url}: {reason}")
 
 
 async def _download_one(

@@ -87,7 +87,7 @@ flowchart TB
     app --> state
     app --> verify
 
-    browser -->|"Playwright<br/>launch_persistent_context(channel=chrome)"| chrome["Installed Google Chrome<br/>with persistent profile dir<br/>(holds your login cookies)"]
+    browser -->|"Playwright<br/>launch_persistent_context(executable_path=found Chrome)"| chrome["Installed Google Chrome<br/>with persistent profile dir<br/>(holds your login cookies)"]
     chrome <-->|"HTTPS"| gp[("photos.google.com")]
 
     subgraph out["--output directory"]

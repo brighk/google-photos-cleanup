@@ -27,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--profile",
         type=Path,
         required=True,
-        help="Persistent Chromium profile directory.",
+        help="Google Chrome profile directory; keeps your Google login between runs.",
     )
     parser.add_argument(
         "--chrome",

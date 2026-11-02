@@ -16,12 +16,14 @@ It does **not** empty Google Photos Trash.
 
 ## Install
 
-Requires [uv](https://docs.astral.sh/uv/).
+Requires [uv](https://docs.astral.sh/uv/) and Google Chrome.
 
 ```bash
 uv sync
-uv run playwright install chromium
 ```
+
+The tool drives your installed Google Chrome. Playwright's downloadable
+browsers are not used, so `playwright install` is not needed.
 
 Run the tool with `uv run gphotos-cleanup ...`, or activate the environment
 once with `source .venv/bin/activate` and use the commands below as written.

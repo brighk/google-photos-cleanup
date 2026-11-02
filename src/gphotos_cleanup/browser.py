@@ -160,6 +160,10 @@ def _with_english(url: str) -> str:
     return urlunsplit(parts._replace(query=urlencode(query)))
 
 
+class _TileNotSelectable(Exception):
+    """A grid tile whose own checkbox could not be found or ticked."""
+
+
 class GooglePhotosBrowser:
     def __init__(
         self,
@@ -516,29 +520,43 @@ class GooglePhotosBrowser:
             f"Too many trash dialogs for {what}. " + await self._debug_hint(page)
         )
 
-    async def trash_all(self, on_trashed: Callable[[list[str]], None]) -> None:
+    async def trash_all(
+        self, on_trashed: Callable[[list[str]], None]
+    ) -> dict[str, str]:
         """
         Move every item in the library to Trash from the grid, without
         opening or downloading anything. Works in batches of TRASH_BATCH:
         tick items from the top of the grid, check Google's "N selected"
         count, trash the selection, reload. Ends when the grid is empty.
         Calls on_trashed with each batch's URLs once Google confirms it.
+
+        Items whose checkbox can't be found or ticked are left in the
+        library. Returns them, each with the reason.
         """
         page = self._require_page()
         trashed: set[str] = set()
+        skipped: dict[str, str] = {}
         while True:
-            batch = await self._select_batch(page, TRASH_BATCH, trashed)
+            batch = await self._select_batch(page, TRASH_BATCH, trashed, skipped)
             if not batch:
-                return
+                return skipped
             await self._trash_selection(page, len(batch))
             trashed.update(batch)
             on_trashed(batch)
             print(f"[OK] moved {len(batch)} item(s) to trash ({len(trashed)} so far)")
 
     async def _select_batch(
-        self, page: Page, limit: int, trashed: set[str]
+        self,
+        page: Page,
+        limit: int,
+        trashed: set[str],
+        skipped: dict[str, str],
     ) -> list[str]:
-        """Tick up to `limit` items from the top of the grid; return their URLs."""
+        """
+        Tick up to `limit` items from the top of the grid; return their URLs.
+        Items that can't be ticked are added to `skipped` and passed over in
+        later batches too.
+        """
         selected: list[str] = []
         # iter_media_urls reloads the grid and scrolls it; ticking happens
         # while it is paused at a yield, so the tile is still on screen.
@@ -551,7 +569,13 @@ class GooglePhotosBrowser:
                         f"{media_url} is still in the grid after being "
                         "trashed. Stopping."
                     )
-                await self._select_tile(page, media_url)
+                if media_url in skipped:
+                    continue
+                reason = await self._try_select_tile(page, media_url)
+                if reason is not None:
+                    print(f"[SKIP] {media_url}: {reason}")
+                    skipped[media_url] = reason
+                    continue
                 selected.append(media_url)
                 if len(selected) >= limit:
                     break
@@ -576,7 +600,29 @@ class GooglePhotosBrowser:
             "selected. Nothing was trashed. " + await self._debug_hint(page)
         )
 
+    async def _try_select_tile(self, page: Page, media_url: str) -> str | None:
+        """Tick the tile, retrying once. Returns why it failed, or None."""
+        try:
+            await self._select_tile(page, media_url)
+            return None
+        except _TileNotSelectable:
+            pass
+        # Usually a tile that hasn't finished rendering: bring it on screen,
+        # give it a moment, and look again.
+        tile = page.locator(f'a[href*="{_item_id(media_url)}"]').first
+        try:
+            await tile.scroll_into_view_if_needed(timeout=5000)
+        except PlaywrightTimeoutError:
+            pass
+        await page.wait_for_timeout(1000)
+        try:
+            await self._select_tile(page, media_url)
+            return None
+        except _TileNotSelectable as exc:
+            return str(exc)
+
     async def _select_tile(self, page: Page, media_url: str) -> None:
+        """Tick the tile's own checkbox, or raise _TileNotSelectable."""
         tile = page.locator(f'a[href*="{_item_id(media_url)}"]').first
         # The tile's own box is the nearest ancestor holding a checkbox. It
         # must hold just this one item, so a date header's "select all"
@@ -584,17 +630,19 @@ class GooglePhotosBrowser:
         box = tile.locator('xpath=ancestor::*[.//*[@role="checkbox"]][1]')
         checkbox = box.locator('[role="checkbox"]')
         items = box.locator('a[href*="/photo/"], a[href*="/video/"]')
+        n_boxes, n_items = await checkbox.count(), await items.count()
+        if n_boxes != 1 or n_items != 1:
+            raise _TileNotSelectable(
+                f"its box holds {n_boxes} checkbox(es) and {n_items} item(s), "
+                "expected 1 and 1"
+            )
         # Google labels the checkbox like the link ("Photo - Portrait -
         # <date>"); a different label means it belongs to something else.
-        if (
-            await checkbox.count() != 1
-            or await items.count() != 1
-            or await checkbox.get_attribute("aria-label")
-            != await tile.get_attribute("aria-label")
-        ):
-            raise RuntimeError(
-                f"Could not find the selection checkbox for {media_url}. "
-                + await self._debug_hint(page)
+        box_label = await checkbox.get_attribute("aria-label")
+        tile_label = await tile.get_attribute("aria-label")
+        if box_label != tile_label:
+            raise _TileNotSelectable(
+                f"checkbox label {box_label!r} differs from link label {tile_label!r}"
             )
 
         async def checked(timeout_s: float) -> bool:
@@ -615,9 +663,7 @@ class GooglePhotosBrowser:
             return
         await checkbox.dispatch_event("click")
         if not await checked(3):
-            raise RuntimeError(
-                f"Could not select {media_url}. " + await self._debug_hint(page)
-            )
+            raise _TileNotSelectable("the checkbox did not turn on after clicking")
 
     async def _trash_selection(self, page: Page, count: int) -> None:
         what = f"{count} selected item(s)"
